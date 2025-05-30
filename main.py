@@ -4,6 +4,7 @@ import logging
 import asyncio
 import json
 import time
+import aiohttp
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -14,15 +15,14 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.error import TimedOut
-from parsers import get_info_efrsb, get_info_kad_arbitr
 
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.FileHandler("bot.log"),  # Логи в файл
-        logging.StreamHandler()  # Логи в консоль
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -32,7 +32,10 @@ load_dotenv()
 
 # Настройка токена
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-PROXY_API_URL = os.getenv('PROXY_API_URL')
+
+# URLs сервисов
+EFRSB_URL = "http://localhost:5001/efrsb"
+KAD_ARBITR_URL = "http://localhost:5002/kad_arbitr"
 
 # Очередь для обработки запросов
 request_queue = asyncio.Queue()
@@ -58,6 +61,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def fetch_service_data(session: aiohttp.ClientSession, url: str, inn: str):
+    """Отправка POST-запроса к сервису."""
+    payload = {"inn": inn}
+    try:
+        async with session.post(url, json=payload, timeout=10) as response:
+            if response.status != 200:
+                logger.error(f"Ошибка HTTP {response.status} при запросе к {url} для ИНН {inn}")
+                return {"error": f"HTTP {response.status}"}
+            return await response.json()
+    except aiohttp.ClientError as e:
+        logger.error(f"Ошибка при запросе к {url} для ИНН {inn}: {str(e)}")
+        return {"error": f"Ошибка сети: {str(e)}"}
+    except asyncio.TimeoutError:
+        logger.error(f"Тайм-аут при запросе к {url} для ИНН {inn}")
+        return {"error": "Тайм-аут запроса"}
+
+
 async def process_request(inn: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка запроса из очереди."""
     user_id = update.effective_user.id
@@ -67,46 +87,11 @@ async def process_request(inn: str, update: Update, context: ContextTypes.DEFAUL
     waiting_message = await update.message.reply_text("Обработка данных начата. Пожалуйста, ожидайте.")
 
     try:
-        # Получение данных с сайтов с повторными попытками
-        efrsb_data = None
-        kad_arbitr_data = None
-
-        for attempt in range(3):
-            try:
-                logger.info(f"Попытка {attempt + 1} получения данных с ЕФРСБ для ИНН {inn}")
-                efrsb_data = await get_info_efrsb(inn, cdp_endpoint="http://localhost:9222")
-                break
-            except Exception as e:
-                logger.warning(f"Ошибка при запросе к ЕФРСБ для ИНН {inn} (попытка {attempt + 1}): {str(e)}")
-                await asyncio.sleep(2)
-        else:
-            logger.error(f"Не удалось получить данные с ЕФРСБ для ИНН {inn} после 3 попыток")
-            efrsb_data = {"error": "Не удалось получить данные с ЕФРСБ после 3 попыток"}
-
-        for attempt in range(3):
-            try:
-                logger.info(f"Попытка {attempt + 1} получения данных с Кад.арбитр для ИНН {inn}")
-                kad_arbitr_data = await get_info_kad_arbitr(inn, cdp_endpoint="http://localhost:9222")
-                break
-            except Exception as e:
-                logger.warning(f"Ошибка при запросе к Кад.арбитр для ИНН {inn} (попытка {attempt + 1}): {str(e)}")
-                await asyncio.sleep(2)
-        else:
-            logger.error(f"Не удалось получить данные с Кад.арбитр для ИНН {inn} после 3 попыток")
-            kad_arbitr_data = {"error": "Не удалось получить данные с Кад.арбитр после 3 попыток"}
-
-        # Парсинг JSON-строк в словари
-        try:
-            efrsb_data = json.loads(efrsb_data)
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка парсинга JSON для ЕФРСБ (ИНН {inn}): {str(e)}")
-            efrsb_data = {"error": f"Ошибка парсинга JSON: {str(e)}"}
-
-        try:
-            kad_arbitr_data = json.loads(kad_arbitr_data)
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка парсинга JSON для Кад.арбитр (ИНН {inn}): {str(e)}")
-            kad_arbitr_data = {"error": f"Ошибка парсинга JSON: {str(e)}"}
+        async with aiohttp.ClientSession() as session:
+            # Параллельные запросы к сервисам
+            efrsb_task = fetch_service_data(session, EFRSB_URL, inn)
+            kad_arbitr_task = fetch_service_data(session, KAD_ARBITR_URL, inn)
+            efrsb_data, kad_arbitr_data = await asyncio.gather(efrsb_task, kad_arbitr_task, return_exceptions=True)
 
         # Формирование отчета
         report = [f"Отчет по должнику (ИНН: {inn})", "============================="]
@@ -117,75 +102,61 @@ async def process_request(inn: str, update: Update, context: ContextTypes.DEFAUL
         # 2. ЕФРСБ
         report.append("\n2. ЕФРСБ")
         report.append("-------------------")
-        if isinstance(efrsb_data, dict):
-            if "error" in efrsb_data:
-                error_msg = efrsb_data.get("error", "Неизвестная ошибка")
-                if "Timeout" in error_msg or "net::ERR_TIMED_OUT" in error_msg:
-                    report.append("- Статус: Недоступно из-за превышения времени ожидания загрузки страницы")
-                elif "Неверный формат" in error_msg:
-                    report.append("- Статус: Не проверено из-за неверного формата. Проверьте формат")
-                else:
-                    report.append(f"- Статус: Ошибка: {error_msg}")
+        if isinstance(efrsb_data, dict) and efrsb_data.get("status") == "success":
+            individuals = efrsb_data.get("individuals", [])
+            legal_entities = efrsb_data.get("legal_entities", [])
+            if not (individuals or legal_entities):
+                report.append("- Банкротство: Не найдено")
             else:
-                individuals = efrsb_data.get("individuals", [])
-                legal_entities = efrsb_data.get("legal_entities", [])
-                if not (individuals or legal_entities):
-                    report.append("- Банкротство: Не найдено")
-                else:
-                    report.append("- Банкротство:")
-                    if individuals:
-                        for idx, person in enumerate(individuals, 1):
-                            report.append(f"  - Физическое лицо {idx}:")
-                            report.append(f"    - ФИО: {person.get('full_name', 'Неизвестно')}")
-                            report.append(f"    - Адрес: {person.get('address', 'Неизвестно')}")
-                            report.append(f"    - Статус: {person.get('status', 'Неизвестно')}")
-                            report.append(f"    - Дата статуса: {person.get('status_date', 'Неизвестно')}")
-                            report.append(f"    - Номер дела: {person.get('court_case_number', 'Неизвестно')}")
-                            report.append(
-                                f"    - Арбитражный управляющий: {person.get('arbitration_manager', 'Неизвестно')}")
-                    if legal_entities:
-                        for idx, entity in enumerate(legal_entities, 1):
-                            report.append(f"  - Юридическое лицо {idx}:")
-                            report.append(f"    - Название: {entity.get('name', 'Неизвестно')}")
-                            report.append(f"    - ИНН: {entity.get('inn', 'Неизвестно')}")
-                            report.append(f"    - Статус: {entity.get('status', 'Неизвестно')}")
-                            report.append(f"    - Дата статуса: {entity.get('status_date', 'Неизвестно')}")
-                            report.append(f"    - Номер дела: {entity.get('court_case_number', 'Неизвестно')}")
-                            report.append(
-                                f"    - Арбитражный управляющий: {entity.get('arbitration_manager', 'Неизвестно')}")
+                report.append("- Банкротство:")
+                if individuals:
+                    for idx, person in enumerate(individuals, 1):
+                        report.append(f"  - Физическое лицо {idx}:")
+                        report.append(f"    - ФИО: {person.get('full_name', 'Неизвестно')}")
+                        report.append(f"    - Адрес: {person.get('address', 'Неизвестно')}")
+                        report.append(f"    - Статус: {person.get('status', 'Неизвестно')}")
+                        report.append(f"    - Дата статуса: {person.get('status_date', 'Неизвестно')}")
+                        report.append(f"    - Номер дела: {person.get('court_case_number', 'Неизвестно')}")
+                        report.append(
+                            f"    - Арбитражный управляющий: {person.get('arbitration_manager', 'Неизвестно')}")
+                if legal_entities:
+                    for idx, entity in enumerate(legal_entities, 1):
+                        report.append(f"  - Юридическое лицо {idx}:")
+                        report.append(f"    - Название: {entity.get('name', 'Неизвестно')}")
+                        report.append(f"    - ИНН: {entity.get('inn', 'Неизвестно')}")
+                        report.append(f"    - Статус: {entity.get('status', 'Неизвестно')}")
+                        report.append(f"    - Дата статуса: {entity.get('status_date', 'Неизвестно')}")
+                        report.append(f"    - Номер дела: {entity.get('court_case_number', 'Неизвестно')}")
+                        report.append(
+                            f"    - Арбитражный управляющий: {entity.get('arbitration_manager', 'Неизвестно')}")
         else:
-            report.append("- Банкротство: Ошибка: Некорректные данные")
+            error_msg = efrsb_data.get("error", "Неизвестная ошибка") if isinstance(efrsb_data,
+                                                                                    dict) else "Некорректные данные"
+            report.append(f"- Статус: Ошибка: {error_msg}")
+            logger.error(f"Ошибка в данных ЕФРСБ для ИНН {inn}: {error_msg}")
 
         # 3. Кад.арбитр
         report.append("\n3. Кад.арбитр")
         report.append("-------------------")
-        if isinstance(kad_arbitr_data, dict):
-            if "error" in kad_arbitr_data:
-                error_msg = kad_arbitr_data.get("error", "Неизвестная ошибка")
-                if "Timeout" in error_msg or "net::ERR_TIMED_OUT" in error_msg:
-                    report.append("- Статус: Недоступно из-за превышения времени ожидания загрузки страницы")
-                elif "Неверный формат" in error_msg:
-                    report.append("- Статус: Не проверено из-за неверного формата. Проверьте формат")
-                elif "капча" in error_msg.lower():
-                    report.append("- Статус: Обнаружена капча, попробуйте позже")
-                else:
-                    report.append(f"- Статус: Ошибка: {error_msg}")
+        if isinstance(kad_arbitr_data, dict) and kad_arbitr_data.get("status") == "success":
+            cases = kad_arbitr_data.get("data", {}).get("cases", [])
+            if not cases:
+                report.append("- Судебные дела: Не найдены")
             else:
-                cases = kad_arbitr_data.get("cases", [])
-                if not cases:
-                    report.append("- Судебные дела: Не найдены")
-                else:
-                    report.append("- Судебные дела:")
-                    for idx, case in enumerate(cases, 1):
-                        report.append(f"  - Дело {idx}:")
-                        report.append(f"    - Номер дела: {case.get('case_number', 'Неизвестно')}")
-                        report.append(f"    - Дата регистрации: {case.get('registration_date', 'Неизвестно')}")
-                        report.append(f"    - Судья: {case.get('judge', 'Неизвестно')}")
-                        report.append(f"    - Текущая инстанция: {case.get('current_instance', 'Неизвестно')}")
-                        report.append(f"    - Истец: {case.get('plaintiff', 'Неизвестно')}")
-                        report.append(f"    - Ответчик: {case.get('respondent', 'Неизвестно')}")
+                report.append("- Судебные дела:")
+                for idx, case in enumerate(cases, 1):
+                    report.append(f"  - Дело {idx}:")
+                    report.append(f"    - Номер дела: {case.get('case_number', 'Неизвестно')}")
+                    report.append(f"    - Дата регистрации: {case.get('registration_date', 'Неизвестно')}")
+                    report.append(f"    - Судья: {case.get('judge', 'Неизвестно')}")
+                    report.append(f"    - Текущая инстанция: {case.get('current_instance', 'Неизвестно')}")
+                    report.append(f"    - Истец: {case.get('plaintiff', 'Неизвестно')}")
+                    report.append(f"    - Ответчик: {case.get('respondent', 'Неизвестно')}")
         else:
-            report.append("- Судебные дела: Ошибка: Некорректные данные")
+            error_msg = kad_arbitr_data.get("error", "Неизвестная ошибка") if isinstance(kad_arbitr_data,
+                                                                                         dict) else "Некорректные данные"
+            report.append(f"- Статус: Ошибка: {error_msg}")
+            logger.error(f"Ошибка в данных Кад.арбитр для ИНН {inn}: {error_msg}")
 
         report.append("=============================")
         response = "\n".join(report)
